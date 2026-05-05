@@ -12,6 +12,9 @@ app = Flask(__name__)
 
 FETCH_TIMEOUT = 10
 
+# Module-level HTTP session: reuses TLS connections + pool across requests.
+_HTTP_SESSION = cffi_requests.Session(impersonate='chrome')
+
 # Wiki citation/edit markers
 WIKI_NOISE_RE = re.compile(r'\[\d+\]|\[edit\]|\[\s*citation needed\s*\]', re.IGNORECASE)
 
@@ -58,7 +61,7 @@ def _is_pdf_url(url: str) -> bool:
 
 def _fetch(url: str):
     try:
-        resp = cffi_requests.get(url, impersonate='chrome', timeout=FETCH_TIMEOUT, allow_redirects=True)
+        resp = _HTTP_SESSION.get(url, timeout=FETCH_TIMEOUT, allow_redirects=True)
         if resp.status_code == 200:
             return resp
     except Exception:
@@ -144,27 +147,30 @@ def search():
     num_results = min(int(request.args.get('n', 5)), 10)
 
     total_start = time.time()
-
-    try:
-        ddgs_results = list(DDGS().text(query, max_results=num_results))
-    except Exception as e:
-        return jsonify({'error': f'search failed: {str(e)}'}), 500
-
-    # Deduplicate by domain+path-prefix before fetching
     seen_domains = set()
-    deduped = []
-    for r in ddgs_results:
-        domain = urlparse(r['href']).netloc + urlparse(r['href']).path[:20]
-        if domain not in seen_domains:
-            seen_domains.add(domain)
-            deduped.append(r)
+    submitted = []  # [(original_result, future)] in DDGS yield order
 
-    # Phase B: URLs -> markdown (parallel)
-    results = []
-    with ThreadPoolExecutor(max_workers=len(deduped) or 1) as executor:
-        futures = {executor.submit(fetch_and_extract, r): r for r in deduped}
-        for future in as_completed(futures):
-            original = futures[future]
+    # Phase A streams into Phase B: as soon as DDGS yields a (deduped) URL,
+    # kick off the fetch — overlaps search latency with extraction.
+    with ThreadPoolExecutor(max_workers=num_results) as executor:
+        try:
+            for r in DDGS().text(query, max_results=num_results):
+                href = r.get('href') or ''
+                if not href:
+                    continue
+                parsed = urlparse(href)
+                domain = parsed.netloc + parsed.path[:20]
+                if domain in seen_domains:
+                    continue
+                seen_domains.add(domain)
+                submitted.append((r, executor.submit(fetch_and_extract, r)))
+        except Exception as e:
+            return jsonify({'error': f'search failed: {str(e)}'}), 500
+
+        results = []
+        futures_map = {fut: r for r, fut in submitted}
+        for future in as_completed(futures_map):
+            original = futures_map[future]
             try:
                 results.append(future.result())
             except Exception as e:
@@ -176,7 +182,7 @@ def search():
                     'elapsed': None,
                 })
 
-    url_order = {r['href']: i for i, r in enumerate(deduped)}
+    url_order = {r['href']: i for i, (r, _) in enumerate(submitted)}
     results.sort(key=lambda x: url_order.get(x.get('url', ''), 999))
 
     return jsonify({
